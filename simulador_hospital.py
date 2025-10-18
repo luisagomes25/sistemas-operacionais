@@ -1,44 +1,30 @@
 #!/usr/bin/env python3
 """
-Simulador de Hospital (threads + semáforos)
-
-- Cada paciente é modelado por um "processo" lógico (objeto Patient).
-- Dentro de cada paciente, as atividades (consulta, exame, cirurgia, leito)
-  são executadas por threads distintas e sincronizadas.
-- Recursos compartilhados: médicos, salas de cirurgia, leitos (semáforos).
-- Há logs de timestamp para acompanhar a execução.
-- Parâmetros configuráveis: N_MEDICOS, N_SALAS, N_LEITOS, N_PACIENTES.
-
-Use: python3 simulador_hospital.py
+Simulador de Hospital usando threads e semáforos para controle de recursos
 """
 import threading
 import time
 import random
 from datetime import datetime
 
-# -------------------------
-# Configuração (ajuste aqui)
-# -------------------------
+# Configuração dos recursos e parâmetros
 N_MEDICOS = 5
 N_SALAS_CIRURGIA = 2
 N_LEITOS = 10
-N_PACIENTES = 25
+N_PACIENTES = 10  # Reduzido para melhor visualização
 
-# Tempo (segundos) - simulação (valores médios)
-TEMPO_CONSULTA_MIN, TEMPO_CONSULTA_MAX = 1.0, 3.0
-TEMPO_EXAME_MIN, TEMPO_EXAME_MAX = 0.5, 2.0
-TEMPO_CIRURGIA_MIN, TEMPO_CIRURGIA_MAX = 2.0, 5.0
-TEMPO_LEITO_MIN, TEMPO_LEITO_MAX = 1.0, 4.0
+# Tempos de cada procedimento (em segundos)
+TEMPO_CONSULTA_MIN, TEMPO_CONSULTA_MAX = 30.0, 45.0
+TEMPO_EXAME_MIN, TEMPO_EXAME_MAX = 25.0, 35.0
+TEMPO_CIRURGIA_MIN, TEMPO_CIRURGIA_MAX = 40.0, 60.0
+TEMPO_LEITO_MIN, TEMPO_LEITO_MAX = 35.0, 50.0
 
-# Probabilidades de cada fluxo
-P_PROB_EXAME = 0.6      # probabilidade de fazer exames após consulta
-P_PROB_CIRURGIA = 0.3   # probabilidade de precisar de cirurgia (após exames)
-# Nota: um paciente pode pular exames e ir direto à cirurgia com pequena prob
+# Probabilidades dos procedimentos
+P_PROB_EXAME = 0.6
+P_PROB_CIRURGIA = 0.3
 P_PROB_CIRURGIA_DIRECT = 0.05
 
-# -------------------------
-# Recursos (semáforos)
-# -------------------------
+# Semáforos para controle de recursos
 medicos_sem = threading.Semaphore(N_MEDICOS)
 salas_sem = threading.Semaphore(N_SALAS_CIRURGIA)
 leitos_sem = threading.Semaphore(N_LEITOS)
@@ -46,18 +32,38 @@ leitos_sem = threading.Semaphore(N_LEITOS)
 # Lock para imprimir sem entrelaçar linhas
 print_lock = threading.Lock()
 
-# Função de log com timestamp
+class Colors:
+    PACIENTE = '\033[94m'
+    MEDICO = '\033[92m'
+    SALA = '\033[95m'
+    LEITO = '\033[93m'
+    RESET = '\033[0m'
+
+# Função de log com timestamp, cores e delay
 def log(msg):
     with print_lock:
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] {msg}")
+        # Adiciona cores baseado no tipo de mensagem
+        if "médico" in msg.lower():
+            color = Colors.MEDICO
+        elif "sala" in msg.lower():
+            color = Colors.SALA
+        elif "leito" in msg.lower():
+            color = Colors.LEITO
+        else:
+            color = Colors.PACIENTE
+            
+        print(f"[{ts}] {color}{msg}{Colors.RESET}")
+        # Pequeno delay após cada log para melhor visualização
+        time.sleep(0.5)  # Aumentado o delay entre mensagens para 0.5 segundos
+        print("----------------------------")
 
 # -------------------------
 # Classe Patient
 # -------------------------
 class Patient:
     def __init__(self, pid):
-        self.pid = pid
+        self.pid = pid # ID do paciente
         # eventos para encadear atividades (simula threads dentro de um "processo")
         self.consulta_done = threading.Event()
         self.exames_done = threading.Event()
@@ -71,12 +77,10 @@ class Patient:
         return t
 
     def run_process(self):
-        log(f"Paciente {self.pid}: iniciado")
-        # 1) Consulta sempre ocorre
         consulta_thread = threading.Thread(target=self.thread_consulta, name=f"Consulta-{self.pid}")
         consulta_thread.start()
-        # aguarda consulta terminar
         self.consulta_done.wait()
+        log(f"Paciente {self.pid} finalizou sua consulta inicial")
 
         # Decide o fluxo do paciente
         fazer_exame = random.random() < P_PROB_EXAME
@@ -111,9 +115,7 @@ class Patient:
                 leito_thread.start()
                 self.leito_done.wait()
 
-        log(f"Paciente {self.pid}: alta (fim do processo)")
 
-    # ---------- atividades -----------
     def thread_consulta(self):
         log(f"Paciente {self.pid}: aguardando médico para consulta")
         acquired = medicos_sem.acquire(timeout=30)  # timeout alto para não bloquear indefinidamente
@@ -216,17 +218,27 @@ class Patient:
 # Simulação
 # -------------------------
 def run_simulation(n_patientes=N_PACIENTES):
-    log("Iniciando simulação do hospital")
-    log(f"Recursos: Médicos={N_MEDICOS}, SalasCirúrgicas={N_SALAS_CIRURGIA}, Leitos={N_LEITOS}")
+    log(f"=== INICIANDO SIMULAÇÃO DO HOSPITAL ===")
+    log(f"Recursos disponíveis:")
+    log(f"- {N_MEDICOS} médicos para atendimento")
+    log(f"- {N_SALAS_CIRURGIA} salas de cirurgia")
+    log(f"- {N_LEITOS} leitos para internação")
+    log(f"Total de {N_PACIENTES} pacientes aguardando atendimento")
+    log("=======================================")
+    
     patients = [Patient(i+1) for i in range(n_patientes)]
     threads = [p.start() for p in patients]
+    
+    log(">>> Todos os pacientes foram registrados e aguardam atendimento")
 
     # aguardando todos pacientes terminarem (join das threads que executam o processo)
     for t in threads:
         t.join()
 
-    log("Simulação concluída")
+    log("=== SIMULAÇÃO CONCLUÍDA ===")
+    log("Todos os pacientes foram atendidos e liberados")
+    log("=======================================")
 
 if __name__ == "__main__":
-    random.seed(42)  # para reprodutibilidade básica; remova para variações
+    random.seed(42)
     run_simulation()
