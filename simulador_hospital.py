@@ -6,12 +6,18 @@ import threading
 import time
 import random
 from datetime import datetime
+from queue import Queue
+from dataclasses import dataclass
+from typing import Optional
 
 # Configuração dos recursos e parâmetros
 N_MEDICOS = 5
 N_SALAS_CIRURGIA = 2
 N_LEITOS = 10
 N_PACIENTES = 10  # Reduzido para melhor visualização
+
+# Configuração das filas de espera
+MAX_TENTATIVAS = 3  # Número máximo de tentativas após timeout
 
 # Tempos de cada procedimento (em segundos)
 TEMPO_CONSULTA_MIN, TEMPO_CONSULTA_MAX = 30.0, 45.0
@@ -29,8 +35,24 @@ medicos_sem = threading.Semaphore(N_MEDICOS)
 salas_sem = threading.Semaphore(N_SALAS_CIRURGIA)
 leitos_sem = threading.Semaphore(N_LEITOS)
 
+# Filas de espera para recursos
+fila_medicos = Queue()
+fila_salas = Queue()
+fila_leitos = Queue()
+
 # Lock para imprimir sem entrelaçar linhas
 print_lock = threading.Lock()
+
+@dataclass
+class SolicitacaoRecurso:
+    paciente_id: int
+    tentativas: int = 0
+    event_complete: Optional[threading.Event] = None
+    recurso_obtido: threading.Event = None
+
+    def __post_init__(self):
+        if self.recurso_obtido is None:
+            self.recurso_obtido = threading.Event()
 
 class Colors:
     PACIENTE = '\033[94m'
@@ -118,11 +140,20 @@ class Patient:
 
     def thread_consulta(self):
         log(f"Paciente {self.pid}: aguardando médico para consulta")
-        acquired = medicos_sem.acquire(timeout=30)  # timeout alto para não bloquear indefinidamente
+        acquired = medicos_sem.acquire(timeout=30)
         if not acquired:
-            log(f"Paciente {self.pid}: tempo de espera por médico excedido na consulta")
-            self.consulta_done.set()
-            return
+            log(f"Paciente {self.pid}: entrando na fila de espera para consulta")
+            solicitacao = SolicitacaoRecurso(
+                paciente_id=self.pid,
+                event_complete=self.consulta_done
+            )
+            fila_medicos.put(solicitacao)
+            # Aguarda até conseguir o recurso ou atingir máximo de tentativas
+            if not solicitacao.recurso_obtido.wait(timeout=180):  # 3 minutos de espera máxima
+                log(f"Paciente {self.pid}: desistiu de esperar por médico na consulta")
+                self.consulta_done.set()
+                return
+            acquired = True  # Se chegou aqui, conseguiu o recurso
         try:
             log(f"Paciente {self.pid}: em consulta (médico alocado)")
             dur = random.uniform(TEMPO_CONSULTA_MIN, TEMPO_CONSULTA_MAX)
@@ -163,9 +194,16 @@ class Patient:
         log(f"Paciente {self.pid}: aguardando sala de cirurgia")
         sala_acquired = salas_sem.acquire(timeout=60)
         if not sala_acquired:
-            log(f"Paciente {self.pid}: tempo de espera por sala de cirurgia excedido")
-            self.cirurgia_done.set()
-            return
+            log(f"Paciente {self.pid}: entrando na fila de espera para sala de cirurgia")
+            solicitacao_sala = SolicitacaoRecurso(
+                paciente_id=self.pid
+            )
+            fila_salas.put(solicitacao_sala)
+            if not solicitacao_sala.recurso_obtido.wait(timeout=180):
+                log(f"Paciente {self.pid}: desistiu de esperar por sala de cirurgia")
+                self.cirurgia_done.set()
+                return
+            sala_acquired = True
         try:
             log(f"Paciente {self.pid}: sala de cirurgia alocada, aguardando médico")
             medico_acquired = medicos_sem.acquire(timeout=60)
@@ -187,9 +225,17 @@ class Patient:
         log(f"Paciente {self.pid}: aguardando leito")
         acquired = leitos_sem.acquire(timeout=120)
         if not acquired:
-            log(f"Paciente {self.pid}: tempo de espera por leito excedido (alta sem leito!)")
-            self.leito_done.set()
-            return
+            log(f"Paciente {self.pid}: entrando na fila de espera para leito")
+            solicitacao = SolicitacaoRecurso(
+                paciente_id=self.pid,
+                event_complete=self.leito_done
+            )
+            fila_leitos.put(solicitacao)
+            if not solicitacao.recurso_obtido.wait(timeout=240):  # 4 minutos de espera máxima
+                log(f"Paciente {self.pid}: desistiu de esperar por leito (alta sem leito!)")
+                self.leito_done.set()
+                return
+            acquired = True
         try:
             log(f"Paciente {self.pid}: leito alocado")
             # opcionalmente, leito pode requerer acompanhamento médico por um curto período
@@ -215,6 +261,66 @@ class Patient:
             self.leito_done.set()
 
 # -------------------------
+# Processamento de Filas de Espera
+# -------------------------
+def processa_fila_medicos():
+    while True:
+        try:
+            solicitacao = fila_medicos.get(timeout=1)  # timeout de 1s para permitir término
+            if medicos_sem.acquire(timeout=30):
+                solicitacao.recurso_obtido.set()
+            else:
+                solicitacao.tentativas += 1
+                if solicitacao.tentativas < MAX_TENTATIVAS:
+                    fila_medicos.put(solicitacao)  # retorna para a fila
+                else:
+                    log(f"Paciente {solicitacao.paciente_id}: máximo de tentativas excedido para médico")
+                    if solicitacao.event_complete:
+                        solicitacao.event_complete.set()
+        except Exception:
+            continue
+
+def processa_fila_salas():
+    while True:
+        try:
+            solicitacao = fila_salas.get(timeout=1)
+            if salas_sem.acquire(timeout=30):
+                solicitacao.recurso_obtido.set()
+            else:
+                solicitacao.tentativas += 1
+                if solicitacao.tentativas < MAX_TENTATIVAS:
+                    fila_salas.put(solicitacao)
+                else:
+                    log(f"Paciente {solicitacao.paciente_id}: máximo de tentativas excedido para sala")
+                    if solicitacao.event_complete:
+                        solicitacao.event_complete.set()
+        except Exception:
+            continue
+
+def processa_fila_leitos():
+    while True:
+        try:
+            solicitacao = fila_leitos.get(timeout=1)
+            if leitos_sem.acquire(timeout=30):
+                solicitacao.recurso_obtido.set()
+            else:
+                solicitacao.tentativas += 1
+                if solicitacao.tentativas < MAX_TENTATIVAS:
+                    fila_leitos.put(solicitacao)
+                else:
+                    log(f"Paciente {solicitacao.paciente_id}: máximo de tentativas excedido para leito")
+                    if solicitacao.event_complete:
+                        solicitacao.event_complete.set()
+        except Exception:
+            continue
+
+def inicia_processamento_filas():
+    # Inicia threads para processar cada fila
+    threading.Thread(target=processa_fila_medicos, daemon=True).start()
+    threading.Thread(target=processa_fila_salas, daemon=True).start()
+    threading.Thread(target=processa_fila_leitos, daemon=True).start()
+
+# -------------------------
 # Simulação
 # -------------------------
 def run_simulation(n_patientes=N_PACIENTES):
@@ -225,6 +331,9 @@ def run_simulation(n_patientes=N_PACIENTES):
     log(f"- {N_LEITOS} leitos para internação")
     log(f"Total de {N_PACIENTES} pacientes aguardando atendimento")
     log("=======================================")
+    
+    # Inicia as threads que processam as filas de espera
+    inicia_processamento_filas()
     
     patients = [Patient(i+1) for i in range(n_patientes)]
     threads = [p.start() for p in patients]
